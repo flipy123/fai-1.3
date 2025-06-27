@@ -2,8 +2,8 @@ import WebSocket from 'ws';
 
 class KotakNeoService {
   constructor() {
-    this.baseUrl = process.env.KOTAK_NEO_BASE_URL;
-    this.wsUrl = process.env.KOTAK_NEO_WS_URL;
+    this.baseUrl = process.env.KOTAK_NEO_BASE_URL || 'https://gw-napi.kotaksecurities.com';
+    this.wsUrl = process.env.KOTAK_NEO_WS_URL || 'wss://mlhsi.kotaksecurities.com';
     this.accessToken = process.env.KOTAK_NEO_ACCESS_TOKEN;
     this.consumerKey = process.env.KOTAK_NEO_CONSUMER_KEY;
     this.consumerSecret = process.env.KOTAK_NEO_CONSUMER_SECRET;
@@ -14,36 +14,64 @@ class KotakNeoService {
     this.ws = null;
     this.isConnected = false;
     this.subscribedTokens = new Set();
-    this.maxTokens = 200; // Kotak Neo limit
+    this.maxTokens = 200;
     this.marketData = new Map();
     this.callbacks = new Map();
+    this.sessionToken = null;
+    this.isAuthenticated = false;
     
-    this.initializeWebSocket();
+    console.log('🔧 KotakNeoService initialized');
+    this.authenticate();
   }
 
-  // Authentication and session management
+  // Step 1: Authentication with Kotak Neo
   async authenticate() {
     try {
+      console.log('🔐 Starting Kotak Neo authentication...');
+      
       if (!this.accessToken) {
-        throw new Error('Access token not provided');
+        throw new Error('Access token not provided in environment variables');
+      }
+
+      // Test the access token by making a simple API call
+      const response = await this.makeApiCall('/Orders/2.3/quick/user/limits', 'GET');
+      
+      if (response) {
+        this.isAuthenticated = true;
+        console.log('✅ Kotak Neo authentication successful');
+        this.initializeWebSocket();
+        return true;
       }
       
-      // Validate token by making a test API call
-      const response = await this.makeApiCall('/Orders/2.3/quick/user/limits', 'GET');
-      console.log('✅ Kotak Neo authentication successful');
-      return true;
     } catch (error) {
       console.error('❌ Kotak Neo authentication failed:', error.message);
-      throw new Error('Kotak Neo authentication failed');
+      this.isAuthenticated = false;
+      
+      // If access token is expired, we need manual intervention
+      if (error.message.includes('401') || error.message.includes('403')) {
+        console.log('🔄 Access token may be expired. Please regenerate token manually.');
+        console.log('📋 Steps to regenerate token:');
+        console.log('1. Visit Kotak Neo API portal');
+        console.log('2. Login with your credentials');
+        console.log('3. Generate new access token');
+        console.log('4. Update KOTAK_NEO_ACCESS_TOKEN in .env file');
+      }
+      
+      return false;
     }
   }
 
   async makeApiCall(endpoint, method = 'GET', data = null) {
+    if (!this.isAuthenticated && !endpoint.includes('/oauth2/')) {
+      throw new Error('Not authenticated with Kotak Neo API');
+    }
+
     const url = `${this.baseUrl}${endpoint}`;
     const headers = {
       'Authorization': `Bearer ${this.accessToken}`,
       'Content-Type': 'application/json',
-      'Accept': 'application/json'
+      'Accept': 'application/json',
+      'User-Agent': 'FAi-3.0-Trading-System'
     };
 
     const options = {
@@ -55,27 +83,41 @@ class KotakNeoService {
       options.body = JSON.stringify(data);
     }
 
+    console.log(`📡 API Call: ${method} ${endpoint}`);
+
     const response = await fetch(url, options);
     
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`API call failed: ${response.status} - ${errorText}`);
+      console.error(`❌ API Error: ${response.status} - ${errorText}`);
+      throw new Error(`Kotak API call failed: ${response.status} - ${errorText}`);
     }
 
-    return await response.json();
+    const result = await response.json();
+    console.log(`✅ API Success: ${endpoint}`);
+    return result;
   }
 
-  // WebSocket connection management
+  // WebSocket connection for live data
   initializeWebSocket() {
+    if (!this.isAuthenticated) {
+      console.log('⚠️ Cannot initialize WebSocket - not authenticated');
+      return;
+    }
+
     if (this.ws) {
       this.ws.close();
     }
 
     try {
-      this.ws = new WebSocket(`${this.wsUrl}/?token=${this.accessToken}`);
+      // Kotak Neo WebSocket URL format
+      const wsUrl = `${this.wsUrl}/?token=${this.accessToken}`;
+      console.log('🔌 Connecting to Kotak Neo WebSocket...');
+      
+      this.ws = new WebSocket(wsUrl);
       
       this.ws.on('open', () => {
-        console.log('🔌 Kotak Neo WebSocket connected');
+        console.log('✅ Kotak Neo WebSocket connected');
         this.isConnected = true;
         this.subscribeToDefaultTokens();
       });
@@ -89,15 +131,19 @@ class KotakNeoService {
         }
       });
 
-      this.ws.on('close', () => {
-        console.log('🔌 Kotak Neo WebSocket disconnected');
+      this.ws.on('close', (code, reason) => {
+        console.log(`🔌 WebSocket disconnected: ${code} - ${reason}`);
         this.isConnected = false;
-        // Reconnect after 5 seconds
-        setTimeout(() => this.initializeWebSocket(), 5000);
+        
+        // Reconnect after 5 seconds if authenticated
+        if (this.isAuthenticated) {
+          setTimeout(() => this.initializeWebSocket(), 5000);
+        }
       });
 
       this.ws.on('error', (error) => {
-        console.error('❌ Kotak Neo WebSocket error:', error);
+        console.error('❌ WebSocket error:', error);
+        this.isConnected = false;
       });
 
     } catch (error) {
@@ -106,42 +152,52 @@ class KotakNeoService {
   }
 
   handleWebSocketMessage(message) {
+    // Handle different message types from Kotak Neo WebSocket
     if (message.type === 'live_feed' && message.data) {
-      const { tk, lp, c, o, h, l, v } = message.data;
+      const { tk, lp, c, o, h, l, v, ltt } = message.data;
       
-      this.marketData.set(tk, {
+      const marketData = {
         token: tk,
-        ltp: lp,
-        change: c,
-        open: o,
-        high: h,
-        low: l,
-        volume: v,
+        ltp: parseFloat(lp) || 0,
+        change: parseFloat(c) || 0,
+        open: parseFloat(o) || 0,
+        high: parseFloat(h) || 0,
+        low: parseFloat(l) || 0,
+        volume: parseInt(v) || 0,
+        lastTradeTime: ltt,
         timestamp: new Date().toISOString()
-      });
+      };
+
+      this.marketData.set(tk, marketData);
 
       // Notify callbacks
       if (this.callbacks.has('market_data')) {
-        this.callbacks.get('market_data')(message.data);
+        this.callbacks.get('market_data')(marketData);
       }
     }
   }
 
   subscribeToDefaultTokens() {
-    // Subscribe to major indices
+    // Subscribe to major indices - these are standard NSE tokens
     const defaultTokens = [
       '26000', // NIFTY 50
-      '26009', // BANK NIFTY
+      '26009', // BANK NIFTY  
       '26037', // FIN NIFTY
       '26074'  // MIDCAP NIFTY
     ];
 
+    console.log('📡 Subscribing to default index tokens...');
     defaultTokens.forEach(token => {
       this.subscribeToToken(token);
     });
   }
 
   subscribeToToken(token) {
+    if (!this.isConnected || !this.ws) {
+      console.log(`⚠️ Cannot subscribe to ${token} - WebSocket not connected`);
+      return false;
+    }
+
     if (this.subscribedTokens.size >= this.maxTokens) {
       console.warn('⚠️ Maximum token subscription limit reached');
       return false;
@@ -151,7 +207,7 @@ class KotakNeoService {
       return true;
     }
 
-    if (this.isConnected && this.ws) {
+    try {
       const subscribeMessage = {
         type: 'subscribe',
         scrips: [token]
@@ -159,19 +215,24 @@ class KotakNeoService {
       
       this.ws.send(JSON.stringify(subscribeMessage));
       this.subscribedTokens.add(token);
-      console.log(`📡 Subscribed to token: ${token}`);
+      console.log(`✅ Subscribed to token: ${token}`);
       return true;
+    } catch (error) {
+      console.error(`❌ Failed to subscribe to token ${token}:`, error);
+      return false;
     }
-
-    return false;
   }
 
   unsubscribeFromToken(token) {
+    if (!this.isConnected || !this.ws) {
+      return true;
+    }
+
     if (!this.subscribedTokens.has(token)) {
       return true;
     }
 
-    if (this.isConnected && this.ws) {
+    try {
       const unsubscribeMessage = {
         type: 'unsubscribe',
         scrips: [token]
@@ -179,51 +240,89 @@ class KotakNeoService {
       
       this.ws.send(JSON.stringify(unsubscribeMessage));
       this.subscribedTokens.delete(token);
-      console.log(`📡 Unsubscribed from token: ${token}`);
+      console.log(`✅ Unsubscribed from token: ${token}`);
       return true;
+    } catch (error) {
+      console.error(`❌ Failed to unsubscribe from token ${token}:`, error);
+      return false;
     }
-
-    return false;
   }
 
   onMarketData(callback) {
     this.callbacks.set('market_data', callback);
   }
 
-  // API Methods
+  // API Methods according to Kotak Neo documentation
   async getIndices() {
     try {
-      // Get master contract for indices
-      const response = await this.makeApiCall('/Files/2.3/masterscrip/NSE', 'GET');
-      
-      // Filter for indices
+      if (!this.isAuthenticated) {
+        throw new Error('Not authenticated');
+      }
+
+      // Get live quotes for indices
       const indices = [
-        { symbol: 'NIFTY', name: 'NIFTY 50', token: '26000' },
-        { symbol: 'BANKNIFTY', name: 'BANK NIFTY', token: '26009' },
-        { symbol: 'FINNIFTY', name: 'FIN NIFTY', token: '26037' },
-        { symbol: 'MIDCPNIFTY', name: 'MIDCAP NIFTY', token: '26074' }
+        { symbol: 'NIFTY', name: 'NIFTY 50', token: '26000', exchange: 'NSE' },
+        { symbol: 'BANKNIFTY', name: 'BANK NIFTY', token: '26009', exchange: 'NSE' },
+        { symbol: 'FINNIFTY', name: 'FIN NIFTY', token: '26037', exchange: 'NSE' },
+        { symbol: 'MIDCPNIFTY', name: 'MIDCAP NIFTY', token: '26074', exchange: 'NSE' }
       ];
 
-      // Add live data if available
-      return indices.map(index => {
-        const liveData = this.marketData.get(index.token);
-        return {
-          ...index,
-          ltp: liveData?.ltp || 0,
-          change: liveData?.change || 0,
-          changePercent: liveData?.ltp && liveData?.change ? 
-            ((liveData.change / (liveData.ltp - liveData.change)) * 100) : 0
-        };
-      });
+      // Get live data for each index
+      const indicesWithData = await Promise.all(
+        indices.map(async (index) => {
+          try {
+            const liveData = this.marketData.get(index.token);
+            if (liveData) {
+              return {
+                ...index,
+                ltp: liveData.ltp,
+                change: liveData.change,
+                changePercent: liveData.ltp && liveData.change ? 
+                  ((liveData.change / (liveData.ltp - liveData.change)) * 100) : 0,
+                high: liveData.high,
+                low: liveData.low,
+                volume: liveData.volume
+              };
+            }
+            
+            // Fallback to REST API if WebSocket data not available
+            const quoteResponse = await this.makeApiCall(`/Quotes/2.3/quote/NSE:${index.symbol}`, 'GET');
+            
+            return {
+              ...index,
+              ltp: parseFloat(quoteResponse.ltp) || 0,
+              change: parseFloat(quoteResponse.netChng) || 0,
+              changePercent: parseFloat(quoteResponse.prcntChng) || 0,
+              high: parseFloat(quoteResponse.dayHigh) || 0,
+              low: parseFloat(quoteResponse.dayLow) || 0,
+              volume: parseInt(quoteResponse.vol) || 0
+            };
+          } catch (error) {
+            console.error(`Error fetching data for ${index.symbol}:`, error);
+            return {
+              ...index,
+              ltp: 0,
+              change: 0,
+              changePercent: 0,
+              high: 0,
+              low: 0,
+              volume: 0
+            };
+          }
+        })
+      );
+
+      return indicesWithData;
 
     } catch (error) {
       console.error('❌ Error fetching indices:', error);
-      // Return mock data if API fails
+      
+      // Return default indices structure if API fails
       return [
-        { symbol: 'NIFTY', name: 'NIFTY 50', ltp: 19850.25, change: 125.30, token: '26000' },
-        { symbol: 'BANKNIFTY', name: 'BANK NIFTY', ltp: 45320.80, change: -85.45, token: '26009' },
-        { symbol: 'FINNIFTY', name: 'FIN NIFTY', ltp: 19120.15, change: 45.75, token: '26037' },
-        { symbol: 'MIDCPNIFTY', name: 'MIDCAP NIFTY', ltp: 10245.60, change: 78.90, token: '26074' }
+        { symbol: 'NIFTY', name: 'NIFTY 50', ltp: 0, change: 0, changePercent: 0, token: '26000' },
+        { symbol: 'BANKNIFTY', name: 'BANK NIFTY', ltp: 0, change: 0, changePercent: 0, token: '26009' },
+        { symbol: 'FINNIFTY', name: 'FIN NIFTY', ltp: 0, change: 0, changePercent: 0, token: '26037' },
+        { symbol: 'MIDCPNIFTY', name: 'MIDCAP NIFTY', ltp: 0, change: 0, changePercent: 0, token: '26074' }
       ];
     }
   }
@@ -232,7 +331,7 @@ class KotakNeoService {
     try {
       const tokenMap = {
         'NIFTY': '26000',
-        'BANKNIFTY': '26009',
+        'BANKNIFTY': '26009', 
         'FINNIFTY': '26037',
         'MIDCPNIFTY': '26074'
       };
@@ -264,74 +363,66 @@ class KotakNeoService {
         };
       }
 
-      // Fallback to REST API if WebSocket data not available
+      // Fallback to REST API
       const response = await this.makeApiCall(`/Quotes/2.3/quote/NSE:${symbol}`, 'GET');
       
       return {
         symbol,
         token,
-        ltp: response.ltp || 0,
-        change: response.netChng || 0,
-        changePercent: response.prcntChng || 0,
-        high: response.dayHigh || 0,
-        low: response.dayLow || 0,
-        open: response.open || 0,
-        volume: response.vol || 0,
+        ltp: parseFloat(response.ltp) || 0,
+        change: parseFloat(response.netChng) || 0,
+        changePercent: parseFloat(response.prcntChng) || 0,
+        high: parseFloat(response.dayHigh) || 0,
+        low: parseFloat(response.dayLow) || 0,
+        open: parseFloat(response.open) || 0,
+        volume: parseInt(response.vol) || 0,
         timestamp: new Date().toISOString()
       };
 
     } catch (error) {
       console.error(`❌ Error fetching market data for ${symbol}:`, error);
-      // Return mock data with some randomization
-      const basePrice = symbol === 'NIFTY' ? 19850 : symbol === 'BANKNIFTY' ? 45320 : 19120;
-      const randomChange = (Math.random() - 0.5) * 20;
-      
-      return {
-        symbol,
-        ltp: basePrice + randomChange,
-        change: randomChange,
-        changePercent: (randomChange / basePrice) * 100,
-        high: basePrice + 50,
-        low: basePrice - 50,
-        open: basePrice + 10,
-        volume: Math.floor(Math.random() * 1000000),
-        timestamp: new Date().toISOString()
-      };
+      throw error;
     }
   }
 
   async getOptionChain(symbol) {
     try {
+      if (!this.isAuthenticated) {
+        throw new Error('Not authenticated');
+      }
+
+      // Use the correct endpoint for option chain
       const response = await this.makeApiCall(`/OptionChain/2.3/optionchain/NSE:${symbol}`, 'GET');
       
-      if (response && response.data) {
+      if (response && response.data && Array.isArray(response.data)) {
         return response.data.map(strike => ({
-          strike: strike.strikePrice,
+          strike: parseFloat(strike.strikePrice) || 0,
           ce: {
-            ltp: strike.CE?.ltp || 0,
-            bid: strike.CE?.bid || 0,
-            ask: strike.CE?.ask || 0,
-            volume: strike.CE?.volume || 0,
-            oi: strike.CE?.openInterest || 0,
-            token: strike.CE?.token
+            ltp: parseFloat(strike.CE?.ltp) || 0,
+            bid: parseFloat(strike.CE?.bid) || 0,
+            ask: parseFloat(strike.CE?.ask) || 0,
+            volume: parseInt(strike.CE?.volume) || 0,
+            oi: parseInt(strike.CE?.openInterest) || 0,
+            token: strike.CE?.token || null
           },
           pe: {
-            ltp: strike.PE?.ltp || 0,
-            bid: strike.PE?.bid || 0,
-            ask: strike.PE?.ask || 0,
-            volume: strike.PE?.volume || 0,
-            oi: strike.PE?.openInterest || 0,
-            token: strike.PE?.token
+            ltp: parseFloat(strike.PE?.ltp) || 0,
+            bid: parseFloat(strike.PE?.bid) || 0,
+            ask: parseFloat(strike.PE?.ask) || 0,
+            volume: parseInt(strike.PE?.volume) || 0,
+            oi: parseInt(strike.PE?.openInterest) || 0,
+            token: strike.PE?.token || null
           }
         }));
       }
 
-      throw new Error('Invalid option chain response');
+      // If no data, return empty array
+      return [];
 
     } catch (error) {
       console.error(`❌ Error fetching option chain for ${symbol}:`, error);
       
-      // Return mock option chain data
+      // Return mock option chain for development
       const strikes = [];
       const basePrice = symbol === 'NIFTY' ? 19850 : symbol === 'BANKNIFTY' ? 45320 : 19120;
       
@@ -344,14 +435,16 @@ class KotakNeoService {
             bid: Math.random() * 100 + 5,
             ask: Math.random() * 100 + 15,
             volume: Math.floor(Math.random() * 10000),
-            oi: Math.floor(Math.random() * 50000)
+            oi: Math.floor(Math.random() * 50000),
+            token: null
           },
           pe: {
             ltp: Math.random() * 100 + 10,
             bid: Math.random() * 100 + 5,
             ask: Math.random() * 100 + 15,
             volume: Math.floor(Math.random() * 10000),
-            oi: Math.floor(Math.random() * 50000)
+            oi: Math.floor(Math.random() * 50000),
+            token: null
           }
         });
       }
@@ -362,19 +455,23 @@ class KotakNeoService {
 
   async getPositions() {
     try {
+      if (!this.isAuthenticated) {
+        throw new Error('Not authenticated');
+      }
+
       const response = await this.makeApiCall('/Portfolio/2.3/portfolio/positions', 'GET');
       
-      if (response && response.data) {
+      if (response && response.data && Array.isArray(response.data)) {
         return response.data.map(position => ({
-          id: position.positionId || position.symbol,
-          symbol: position.tradingSymbol,
-          quantity: position.netQuantity,
-          avgPrice: position.avgPrice,
-          ltp: position.ltp,
-          pnl: position.unrealizedPnl,
-          pnlPercent: position.pnlPercent || 0,
-          product: position.product,
-          exchange: position.exchange
+          id: position.positionId || position.tradingSymbol || Date.now().toString(),
+          symbol: position.tradingSymbol || 'Unknown',
+          quantity: parseInt(position.netQuantity) || 0,
+          avgPrice: parseFloat(position.avgPrice) || 0,
+          ltp: parseFloat(position.ltp) || 0,
+          pnl: parseFloat(position.unrealizedPnl) || 0,
+          pnlPercent: parseFloat(position.pnlPercent) || 0,
+          product: position.product || 'MIS',
+          exchange: position.exchange || 'NSE'
         }));
       }
 
@@ -382,46 +479,29 @@ class KotakNeoService {
 
     } catch (error) {
       console.error('❌ Error fetching positions:', error);
-      
-      // Return mock positions
-      return [
-        {
-          id: '1',
-          symbol: 'NIFTY24JAN19900CE',
-          quantity: 50,
-          avgPrice: 125.50,
-          ltp: 132.25,
-          pnl: 337.50,
-          pnlPercent: 5.38
-        },
-        {
-          id: '2',
-          symbol: 'BANKNIFTY24JAN45000PE',
-          quantity: -25,
-          avgPrice: 85.75,
-          ltp: 78.20,
-          pnl: 188.75,
-          pnlPercent: 8.81
-        }
-      ];
+      return [];
     }
   }
 
   async getOrders() {
     try {
+      if (!this.isAuthenticated) {
+        throw new Error('Not authenticated');
+      }
+
       const response = await this.makeApiCall('/Orders/2.3/quick/user/orders', 'GET');
       
-      if (response && response.data) {
+      if (response && response.data && Array.isArray(response.data)) {
         return response.data.map(order => ({
-          id: order.orderId,
-          symbol: order.tradingSymbol,
-          side: order.transactionType,
-          quantity: order.quantity,
-          price: order.price,
-          status: order.orderStatus,
+          id: order.orderId || Date.now().toString(),
+          symbol: order.tradingSymbol || 'Unknown',
+          side: order.transactionType || 'BUY',
+          quantity: parseInt(order.quantity) || 0,
+          price: parseFloat(order.price) || 0,
+          status: order.orderStatus || 'PENDING',
           timestamp: order.orderTimestamp || new Date().toISOString(),
-          product: order.product,
-          exchange: order.exchange
+          product: order.product || 'MIS',
+          exchange: order.exchange || 'NSE'
         }));
       }
 
@@ -429,36 +509,34 @@ class KotakNeoService {
 
     } catch (error) {
       console.error('❌ Error fetching orders:', error);
-      
-      // Return mock orders
-      return [
-        {
-          id: '1',
-          symbol: 'NIFTY24JAN19900CE',
-          side: 'BUY',
-          quantity: 50,
-          price: 125.50,
-          status: 'COMPLETE',
-          timestamp: new Date().toISOString()
-        }
-      ];
+      return [];
     }
   }
 
   async placeOrder(orderData) {
     try {
+      if (!this.isAuthenticated) {
+        throw new Error('Not authenticated');
+      }
+
       const orderPayload = {
         tradingSymbol: orderData.symbol,
         transactionType: orderData.side,
-        quantity: orderData.quantity,
-        price: orderData.price,
+        quantity: orderData.quantity.toString(),
+        price: orderData.price.toString(),
         product: orderData.product || 'MIS',
         orderType: orderData.orderType || 'L',
         validity: orderData.validity || 'DAY',
-        exchange: orderData.exchange || 'NSE',
-        stopLoss: orderData.stopLoss,
-        target: orderData.target
+        exchange: orderData.exchange || 'NSE'
       };
+
+      // Add stop loss and target if provided
+      if (orderData.stopLoss) {
+        orderPayload.stopLoss = orderData.stopLoss.toString();
+      }
+      if (orderData.target) {
+        orderPayload.target = orderData.target.toString();
+      }
 
       const response = await this.makeApiCall('/Orders/2.3/quick/order/place', 'POST', orderPayload);
       
@@ -470,40 +548,53 @@ class KotakNeoService {
 
     } catch (error) {
       console.error('❌ Error placing order:', error);
-      
-      // Return mock order response
-      return {
-        orderId: Date.now().toString(),
-        status: 'PENDING',
-        message: 'Order placed successfully (TEST MODE)'
-      };
+      throw error;
     }
   }
 
   async getWallet() {
     try {
+      if (!this.isAuthenticated) {
+        throw new Error('Not authenticated');
+      }
+
       const response = await this.makeApiCall('/Orders/2.3/quick/user/limits', 'GET');
       
       if (response && response.data) {
         return {
-          availableBalance: response.data.availableBalance || 0,
-          usedMargin: response.data.usedMargin || 0,
-          totalBalance: response.data.totalBalance || 0
+          availableBalance: parseFloat(response.data.availableBalance) || 0,
+          usedMargin: parseFloat(response.data.usedMargin) || 0,
+          totalBalance: parseFloat(response.data.totalBalance) || 0
         };
       }
 
-      throw new Error('Invalid wallet response');
+      // Return default wallet if no data
+      return {
+        availableBalance: 0,
+        usedMargin: 0,
+        totalBalance: 0
+      };
 
     } catch (error) {
       console.error('❌ Error fetching wallet:', error);
       
-      // Return mock wallet data
+      // Return mock wallet for development
       return {
         availableBalance: 150000.50,
         usedMargin: 45000.25,
         totalBalance: 195000.75
       };
     }
+  }
+
+  // Get connection status
+  getConnectionStatus() {
+    return {
+      isAuthenticated: this.isAuthenticated,
+      isConnected: this.isConnected,
+      subscribedTokens: this.subscribedTokens.size,
+      maxTokens: this.maxTokens
+    };
   }
 
   // Cleanup method
@@ -516,6 +607,7 @@ class KotakNeoService {
     this.subscribedTokens.clear();
     this.marketData.clear();
     this.callbacks.clear();
+    console.log('🔌 Kotak Neo service disconnected');
   }
 }
 

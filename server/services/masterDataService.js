@@ -3,7 +3,7 @@ import path from 'path';
 
 class MasterDataService {
   constructor() {
-    this.baseUrl = process.env.KOTAK_NEO_BASE_URL;
+    this.baseUrl = process.env.KOTAK_NEO_BASE_URL || 'https://gw-napi.kotaksecurities.com';
     this.accessToken = process.env.KOTAK_NEO_ACCESS_TOKEN;
     this.dataPath = './data';
     this.masterDataFile = path.join(this.dataPath, 'master_data.json');
@@ -15,14 +15,17 @@ class MasterDataService {
     }
     
     this.masterData = null;
+    this.indicesData = new Map();
     this.optionsData = new Map();
     this.instrumentTokens = new Map();
+    
+    console.log('📂 Master Data Service initialized');
   }
 
   async initialize() {
     try {
       await this.loadMasterData();
-      console.log('✅ Master Data Service initialized');
+      console.log('✅ Master Data Service ready');
     } catch (error) {
       console.error('❌ Master Data Service initialization failed:', error);
     }
@@ -58,24 +61,37 @@ class MasterDataService {
 
   async downloadMasterData() {
     try {
+      if (!this.accessToken) {
+        throw new Error('Access token not available');
+      }
+
       const exchanges = ['NSE', 'NFO']; // NSE for indices, NFO for options
       const allData = {};
 
       for (const exchange of exchanges) {
-        const response = await fetch(`${this.baseUrl}/Files/2.3/masterscrip/${exchange}`, {
-          headers: {
-            'Authorization': `Bearer ${this.accessToken}`,
-            'Accept': 'application/json'
+        try {
+          console.log(`📡 Downloading ${exchange} master data...`);
+          
+          const response = await fetch(`${this.baseUrl}/Files/2.3/masterscrip/${exchange}`, {
+            headers: {
+              'Authorization': `Bearer ${this.accessToken}`,
+              'Accept': 'application/json',
+              'Content-Type': 'application/json'
+            }
+          });
+
+          if (!response.ok) {
+            throw new Error(`Failed to fetch ${exchange} master data: ${response.status}`);
           }
-        });
 
-        if (!response.ok) {
-          throw new Error(`Failed to fetch ${exchange} master data: ${response.status}`);
+          const data = await response.json();
+          allData[exchange] = Array.isArray(data) ? data : (data.data || []);
+          
+          console.log(`✅ Downloaded ${exchange} master data: ${allData[exchange].length} instruments`);
+        } catch (error) {
+          console.error(`❌ Failed to download ${exchange} data:`, error);
+          allData[exchange] = [];
         }
-
-        const data = await response.json();
-        allData[exchange] = data;
-        console.log(`✅ Downloaded ${exchange} master data: ${data.length || 0} instruments`);
       }
 
       // Save to file
@@ -104,54 +120,75 @@ class MasterDataService {
         this.masterData = JSON.parse(data);
         console.log('✅ Loaded cached master data');
       } else {
-        throw new Error('No cached master data found');
+        console.log('⚠️ No cached master data found, using defaults');
+        this.masterData = { NSE: [], NFO: [] };
       }
     } catch (error) {
       console.error('❌ Failed to load cached data:', error);
-      this.masterData = { NSE: [], NFO: [] }; // Empty fallback
+      this.masterData = { NSE: [], NFO: [] };
     }
   }
 
   processMasterData() {
     if (!this.masterData) return;
 
-    // Process NSE data for indices
-    if (this.masterData.NSE) {
+    console.log('🔄 Processing master data...');
+
+    // Process NSE data for indices only
+    if (this.masterData.NSE && Array.isArray(this.masterData.NSE)) {
+      let indicesCount = 0;
+      
       this.masterData.NSE.forEach(instrument => {
-        if (this.isIndex(instrument.tradingSymbol)) {
-          this.instrumentTokens.set(instrument.tradingSymbol, {
-            token: instrument.token,
-            symbol: instrument.tradingSymbol,
-            name: instrument.companyName || instrument.tradingSymbol,
-            exchange: 'NSE',
-            lotSize: instrument.lotSize || 1
-          });
-        }
-      });
-    }
-
-    // Process NFO data for options
-    if (this.masterData.NFO) {
-      const optionsByUnderlying = new Map();
-
-      this.masterData.NFO.forEach(instrument => {
-        if (this.isOption(instrument)) {
-          const underlying = this.getUnderlyingFromOption(instrument.tradingSymbol);
+        if (this.isIndex(instrument.tradingSymbol || instrument.symbol)) {
+          const symbol = instrument.tradingSymbol || instrument.symbol;
+          const token = instrument.token || instrument.instrumentToken;
           
-          if (!optionsByUnderlying.has(underlying)) {
-            optionsByUnderlying.set(underlying, []);
-          }
-
-          optionsByUnderlying.get(underlying).push({
-            token: instrument.token,
-            symbol: instrument.tradingSymbol,
-            underlying: underlying,
-            strike: this.extractStrike(instrument.tradingSymbol),
-            optionType: this.getOptionType(instrument.tradingSymbol),
-            expiry: instrument.expiry,
+          this.indicesData.set(symbol, {
+            token: token,
+            symbol: symbol,
+            name: instrument.companyName || instrument.name || symbol,
+            exchange: 'NSE',
             lotSize: instrument.lotSize || 1,
             tickSize: instrument.tickSize || 0.05
           });
+          
+          this.instrumentTokens.set(symbol, token);
+          indicesCount++;
+        }
+      });
+      
+      console.log(`📊 Processed ${indicesCount} indices from NSE data`);
+    }
+
+    // Process NFO data for options only
+    if (this.masterData.NFO && Array.isArray(this.masterData.NFO)) {
+      const optionsByUnderlying = new Map();
+      let optionsCount = 0;
+
+      this.masterData.NFO.forEach(instrument => {
+        if (this.isOption(instrument)) {
+          const symbol = instrument.tradingSymbol || instrument.symbol;
+          const underlying = this.getUnderlyingFromOption(symbol);
+          
+          // Only process options for our supported indices
+          if (this.isSupportedUnderlying(underlying)) {
+            if (!optionsByUnderlying.has(underlying)) {
+              optionsByUnderlying.set(underlying, []);
+            }
+
+            optionsByUnderlying.get(underlying).push({
+              token: instrument.token || instrument.instrumentToken,
+              symbol: symbol,
+              underlying: underlying,
+              strike: this.extractStrike(symbol),
+              optionType: this.getOptionType(symbol),
+              expiry: instrument.expiry || instrument.expiryDate,
+              lotSize: instrument.lotSize || 1,
+              tickSize: instrument.tickSize || 0.05
+            });
+            
+            optionsCount++;
+          }
         }
       });
 
@@ -168,25 +205,37 @@ class MasterDataService {
 
         this.optionsData.set(underlying, options);
       });
+
+      console.log(`📈 Processed ${optionsCount} options for ${optionsByUnderlying.size} underlyings`);
     }
 
-    console.log(`📊 Processed master data:`);
-    console.log(`   - Indices: ${this.instrumentTokens.size}`);
+    console.log(`📋 Master data processing complete:`);
+    console.log(`   - Indices: ${this.indicesData.size}`);
     console.log(`   - Option chains: ${this.optionsData.size}`);
   }
 
   isIndex(symbol) {
+    if (!symbol) return false;
     const indices = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'SENSEX', 'BANKEX'];
-    return indices.some(index => symbol.includes(index));
+    return indices.some(index => symbol.toUpperCase().includes(index));
   }
 
   isOption(instrument) {
-    return instrument.tradingSymbol && 
-           (instrument.tradingSymbol.includes('CE') || instrument.tradingSymbol.includes('PE')) &&
-           instrument.expiry;
+    const symbol = instrument.tradingSymbol || instrument.symbol || '';
+    return symbol && 
+           (symbol.includes('CE') || symbol.includes('PE')) &&
+           (instrument.expiry || instrument.expiryDate) &&
+           (instrument.instrumentType === 'OPTIDX' || symbol.match(/\d+(CE|PE)$/));
+  }
+
+  isSupportedUnderlying(underlying) {
+    const supported = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'];
+    return supported.includes(underlying);
   }
 
   getUnderlyingFromOption(symbol) {
+    if (!symbol) return null;
+    
     // Extract underlying from option symbol
     // e.g., "NIFTY24JAN19900CE" -> "NIFTY"
     const match = symbol.match(/^([A-Z]+)/);
@@ -194,6 +243,8 @@ class MasterDataService {
   }
 
   extractStrike(symbol) {
+    if (!symbol) return 0;
+    
     // Extract strike price from option symbol
     // e.g., "NIFTY24JAN19900CE" -> 19900
     const match = symbol.match(/(\d+)(CE|PE)$/);
@@ -201,34 +252,49 @@ class MasterDataService {
   }
 
   getOptionType(symbol) {
+    if (!symbol) return 'CE';
     return symbol.endsWith('CE') ? 'CE' : 'PE';
   }
 
   // Public methods
-  getIndexToken(symbol) {
-    return this.instrumentTokens.get(symbol);
+  getAllIndices() {
+    const indices = Array.from(this.indicesData.values());
+    
+    // If no indices from master data, return defaults
+    if (indices.length === 0) {
+      return [
+        { symbol: 'NIFTY', name: 'NIFTY 50', token: '26000', exchange: 'NSE' },
+        { symbol: 'BANKNIFTY', name: 'BANK NIFTY', token: '26009', exchange: 'NSE' },
+        { symbol: 'FINNIFTY', name: 'FIN NIFTY', token: '26037', exchange: 'NSE' },
+        { symbol: 'MIDCPNIFTY', name: 'MIDCAP NIFTY', token: '26074', exchange: 'NSE' }
+      ];
+    }
+    
+    return indices;
   }
 
-  getAllIndices() {
-    return Array.from(this.instrumentTokens.values());
+  getIndexToken(symbol) {
+    return this.indicesData.get(symbol);
   }
 
   getOptionsForUnderlying(underlying, nearestExpiry = true) {
     const options = this.optionsData.get(underlying) || [];
     
-    if (!nearestExpiry) {
+    if (!nearestExpiry || options.length === 0) {
       return options;
     }
 
     // Get only nearest expiry options
-    if (options.length === 0) return [];
-    
     const nearestExpiryDate = options[0].expiry;
     return options.filter(option => option.expiry === nearestExpiryDate);
   }
 
   getOptionChainStrikes(underlying, atmStrike, range = 10) {
     const options = this.getOptionsForUnderlying(underlying);
+    
+    if (options.length === 0) {
+      return [];
+    }
     
     // Filter strikes around ATM
     const minStrike = atmStrike - (range * 50);
@@ -261,15 +327,15 @@ class MasterDataService {
     const tokens = [];
 
     // Add index token
-    const indexToken = this.getIndexToken(underlying);
-    if (indexToken) {
-      tokens.push(indexToken.token);
+    const indexData = this.getIndexToken(underlying);
+    if (indexData && indexData.token) {
+      tokens.push(indexData.token);
     }
 
     // Add option tokens
     strikes.forEach(strike => {
-      if (strike.ce) tokens.push(strike.ce.token);
-      if (strike.pe) tokens.push(strike.pe.token);
+      if (strike.ce && strike.ce.token) tokens.push(strike.ce.token);
+      if (strike.pe && strike.pe.token) tokens.push(strike.pe.token);
     });
 
     return tokens.slice(0, 200); // Respect Kotak's 200 token limit
@@ -287,6 +353,11 @@ class MasterDataService {
       fs.unlinkSync(this.lastDownloadFile);
     }
 
+    // Clear in-memory data
+    this.indicesData.clear();
+    this.optionsData.clear();
+    this.instrumentTokens.clear();
+
     // Download fresh data
     await this.loadMasterData();
   }
@@ -294,10 +365,11 @@ class MasterDataService {
   // Get statistics
   getStats() {
     return {
-      indices: this.instrumentTokens.size,
+      indices: this.indicesData.size,
       optionChains: this.optionsData.size,
       lastDownload: this.getLastDownloadDate(),
-      totalOptions: Array.from(this.optionsData.values()).reduce((sum, options) => sum + options.length, 0)
+      totalOptions: Array.from(this.optionsData.values()).reduce((sum, options) => sum + options.length, 0),
+      supportedIndices: Array.from(this.indicesData.keys())
     };
   }
 }

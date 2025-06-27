@@ -1,9 +1,17 @@
 import express from 'express';
 import { kotakNeoService } from '../services/kotakNeoService.js';
+import { masterDataService } from '../services/masterDataService.js';
+import { tradeMemoryService } from '../services/tradeMemoryService.js';
 
 const router = express.Router();
 
-// Authentication callback (for OAuth2 flow)
+// Authentication status
+router.get('/auth-status', (req, res) => {
+  const status = kotakNeoService.getConnectionStatus();
+  res.json(status);
+});
+
+// Authentication callback (for OAuth2 flow if needed)
 router.get('/callback', async (req, res) => {
   try {
     const { code, state } = req.query;
@@ -12,8 +20,6 @@ router.get('/callback', async (req, res) => {
       return res.status(400).json({ error: 'Authorization code not provided' });
     }
 
-    // Handle OAuth2 callback
-    // This would typically exchange the code for an access token
     console.log('OAuth2 callback received:', { code, state });
     
     res.json({ 
@@ -29,10 +35,32 @@ router.get('/callback', async (req, res) => {
 // Get all indices for dropdown
 router.get('/indices', async (req, res) => {
   try {
-    const indices = await kotakNeoService.getIndices();
+    console.log('📊 Fetching indices...');
+    
+    // Get indices from master data service first
+    const masterIndices = masterDataService.getAllIndices();
+    
+    // Get live data from Kotak Neo service
+    const liveIndices = await kotakNeoService.getIndices();
+    
+    // Merge master data with live data
+    const indices = masterIndices.map(masterIndex => {
+      const liveData = liveIndices.find(live => live.symbol === masterIndex.symbol);
+      return {
+        ...masterIndex,
+        ltp: liveData?.ltp || 0,
+        change: liveData?.change || 0,
+        changePercent: liveData?.changePercent || 0,
+        high: liveData?.high || 0,
+        low: liveData?.low || 0,
+        volume: liveData?.volume || 0
+      };
+    });
+
+    console.log(`✅ Returning ${indices.length} indices`);
     res.json(indices);
   } catch (error) {
-    console.error('Error fetching indices:', error);
+    console.error('❌ Error fetching indices:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -41,10 +69,12 @@ router.get('/indices', async (req, res) => {
 router.get('/market-data/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
+    console.log(`📈 Fetching market data for ${symbol}`);
+    
     const marketData = await kotakNeoService.getMarketData(symbol);
     res.json(marketData);
   } catch (error) {
-    console.error(`Error fetching market data for ${req.params.symbol}:`, error);
+    console.error(`❌ Error fetching market data for ${req.params.symbol}:`, error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -53,10 +83,12 @@ router.get('/market-data/:symbol', async (req, res) => {
 router.get('/option-chain/:symbol', async (req, res) => {
   try {
     const { symbol } = req.params;
+    console.log(`📊 Fetching option chain for ${symbol}`);
+    
     const optionChain = await kotakNeoService.getOptionChain(symbol);
     res.json(optionChain);
   } catch (error) {
-    console.error(`Error fetching option chain for ${req.params.symbol}:`, error);
+    console.error(`❌ Error fetching option chain for ${req.params.symbol}:`, error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -64,10 +96,11 @@ router.get('/option-chain/:symbol', async (req, res) => {
 // Get positions
 router.get('/positions', async (req, res) => {
   try {
+    console.log('📋 Fetching positions...');
     const positions = await kotakNeoService.getPositions();
     res.json(positions);
   } catch (error) {
-    console.error('Error fetching positions:', error);
+    console.error('❌ Error fetching positions:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -75,10 +108,11 @@ router.get('/positions', async (req, res) => {
 // Get orders
 router.get('/orders', async (req, res) => {
   try {
+    console.log('📋 Fetching orders...');
     const orders = await kotakNeoService.getOrders();
     res.json(orders);
   } catch (error) {
-    console.error('Error fetching orders:', error);
+    console.error('❌ Error fetching orders:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -86,10 +120,24 @@ router.get('/orders', async (req, res) => {
 // Place order
 router.post('/order', async (req, res) => {
   try {
+    console.log('📝 Placing order:', req.body);
     const order = await kotakNeoService.placeOrder(req.body);
+    
+    // Log the trade in memory
+    tradeMemoryService.addTrade(req.body.symbol, {
+      action: req.body.side,
+      symbol: req.body.symbol,
+      quantity: req.body.quantity,
+      price: req.body.price,
+      stopLoss: req.body.stopLoss,
+      target: req.body.target,
+      status: 'PENDING',
+      orderId: order.orderId
+    });
+    
     res.json(order);
   } catch (error) {
-    console.error('Error placing order:', error);
+    console.error('❌ Error placing order:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -97,21 +145,19 @@ router.post('/order', async (req, res) => {
 // Get wallet balance
 router.get('/wallet', async (req, res) => {
   try {
+    console.log('💰 Fetching wallet...');
     const wallet = await kotakNeoService.getWallet();
     res.json(wallet);
   } catch (error) {
-    console.error('Error fetching wallet:', error);
+    console.error('❌ Error fetching wallet:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // WebSocket status
 router.get('/ws-status', (req, res) => {
-  res.json({
-    connected: kotakNeoService.isConnected,
-    subscribedTokens: kotakNeoService.subscribedTokens.size,
-    maxTokens: kotakNeoService.maxTokens
-  });
+  const status = kotakNeoService.getConnectionStatus();
+  res.json(status);
 });
 
 // Subscribe to additional tokens
@@ -149,6 +195,55 @@ router.post('/unsubscribe', (req, res) => {
     }));
 
     res.json({ results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Master data endpoints
+router.get('/master-data/stats', (req, res) => {
+  try {
+    const stats = masterDataService.getStats();
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/master-data/refresh', async (req, res) => {
+  try {
+    await masterDataService.forceRefresh();
+    res.json({ success: true, message: 'Master data refreshed successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Trading endpoints
+router.get('/trading/stats/:symbol', (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const stats = tradeMemoryService.getPerformanceMetrics(symbol);
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.post('/trading/reset-all', (req, res) => {
+  try {
+    const { symbol } = req.body;
+    tradeMemoryService.resetTrades(symbol);
+    res.json({ success: true, message: 'Trades reset successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+router.get('/trading/dashboard-stats', (req, res) => {
+  try {
+    const stats = tradeMemoryService.getDashboardStats();
+    res.json(stats);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
